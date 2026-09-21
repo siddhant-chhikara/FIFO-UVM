@@ -1,0 +1,262 @@
+FIFO Verification Project Log (SystemVerilog)
+
+---
+
+1. Objective
+
+I set out to design and verify a synchronous FIFO using SystemVerilog while building the verification environment from scratch (non-UVM).
+
+The goal was to understand real verification concepts:
+
+* timing alignment
+* protocol correctness
+* debugging based on behavior, not assumptions
+
+---
+
+2. Design + Setup
+
+I implemented:
+
+* 8-bit FIFO, depth = 8
+* control signals: wr_en, rd_en, full, empty
+* pointer + count-based logic
+* registered read output (1-cycle latency)
+
+Key behavior:
+rd_en → request
+rd_op → valid next cycle
+
+---
+
+3. Verification Architecture
+
+Driver → Interface → DUT → Monitor → Scoreboard
+
+Driver:
+
+* generates stimulus
+
+Monitor:
+
+* observes DUT behavior
+* aligns timing
+
+Scoreboard:
+
+* queue-based reference model
+* compares expected vs actual
+
+Interface:
+
+* ensures proper clocking and timing
+
+---
+
+4. Directed Testing (Initial Bring-Up)
+
+I started with a simple test:
+write → read → check order
+
+This confirmed:
+FIFO works in clean conditions
+
+Limitation:
+only tested happy path
+no edge cases covered
+
+---
+
+5. Issue #1 — Data Misalignment
+
+Observation:
+Expected=10 Got=0
+Expected=20 Got=10
+
+Understanding:
+I was sampling rd_op too early
+
+rd_en is a request
+data becomes valid next cycle
+
+Fix:
+Delayed read condition inside monitor
+
+Learning:
+Control and data must be aligned explicitly
+
+---
+
+6. Issue #2 — Missing Last Value
+
+Observation:
+Last value was not appearing
+
+Cause:
+Using delayed rd_en with current empty
+→ mixing different cycles
+
+Fix:
+Removed dependency on empty during read
+Used only delayed rd_en
+
+Learning:
+Signals must belong to same time context
+
+---
+
+7. Random Testing Phase
+
+Upgraded driver to:
+
+* random operations (IDLE, READ, WRITE, BOTH)
+* random data
+* protocol filtering
+
+This moved testing from:
+fixed → unpredictable
+
+---
+
+8. Issue #3 — Underflow + Cascade Failure
+
+Observation:
+PASS PASS PASS ...
+ERROR: Underflow
+followed by many mismatches
+
+Initial confusion:
+looked like data delay or FIFO bug
+
+Actual understanding:
+first underflow corrupted the scoreboard
+
+---
+
+9. Root Cause Analysis
+
+Driver logic:
+if (!vif.empty) → allow read
+
+Problem:
+empty updates after clock edge
+
+So:
+driver sees empty=0
+FIFO becomes empty next cycle
+→ illegal read happens
+
+Effect:
+one bad read → scoreboard queue breaks
+→ all future comparisons fail
+
+---
+
+10. Key Realization
+
+Testbench must not depend on DUT signals
+
+Reason:
+DUT signals are time-shifted
+Driver decisions become unsafe
+
+---
+
+11. My Fix Strategy
+
+Instead of using empty/full,
+I decided to track:
+
+expected_count = writes - reads
+
+Rules:
+if expected_count == 0 → block read
+if expected_count == DEPTH → block write
+
+Why:
+this is my own model
+no timing dependency
+no race conditions
+
+---
+
+12. Final Driver Logic
+
+* Random operation selection
+* Then filtered based on legality
+
+Examples:
+EMPTY + READ → blocked
+FULL + WRITE → blocked
+BOTH → converted to valid operation
+
+Flow:
+random → validate → apply
+
+---
+
+13. Debugging Approach
+
+Focused only on:
+first failure
+
+Reason:
+first error = root cause
+remaining errors = consequences
+
+---
+
+14. Key Learnings
+
+15. Latency matters
+    Signals are not valid in same cycle
+
+16. Timing > values
+    Correct value at wrong time is still wrong
+
+17. Random testing is necessary
+    Directed tests hide real bugs
+
+18. Scoreboard sensitivity
+    One wrong transaction corrupts entire checking
+
+19. Testbench independence
+    Never blindly trust DUT signals
+
+20. Think in transactions
+    Cycle count ≠ valid operations
+
+---
+
+15. Current Status
+
+I now have:
+
+* working FIFO design
+* random, protocol-aware driver
+* latency-correct monitor
+* queue-based scoreboard
+* ability to debug real verification issues
+
+---
+
+16. Next Steps
+
+* functional coverage (measure completeness)
+* assertions (automatic checks)
+* longer random stress runs
+
+---
+
+17. Final Reflection
+
+The project shifted my thinking from:
+“Does it run?”
+
+to:
+“Is it correct under all conditions?”
+
+The biggest improvement:
+understanding behavior in time, not just signals
+
+---
