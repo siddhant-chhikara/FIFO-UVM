@@ -1,4 +1,5 @@
 # FIFO — UVM Verification with Functional Coverage Closure
+![UVM simulation — 100,001 cycles, coverage closed](FIFO_Simulation_UVM.png)
 
 A UVM verification environment for an 8×8 synchronous FIFO, built in SystemVerilog and run in Vivado 2026.1 (xsim). Constrained-random stimulus, queue-based reference model, SVA, and a functional coverage model closed to 100%.
 
