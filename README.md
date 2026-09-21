@@ -1,9 +1,16 @@
 # FIFO — UVM Verification with Functional Coverage Closure
+
 ![UVM simulation — 100,001 cycles, coverage closed](FIFO_Simulation_UVM.png)
 
 A UVM verification environment for an 8×8 synchronous FIFO, built in SystemVerilog and run in Vivado 2026.1 (xsim). Constrained-random stimulus, queue-based reference model, SVA, and a functional coverage model closed to 100%.
 
-The repository also contains the original class-based (non-UVM) testbench the environment was converted from, kept for comparison.
+The repository also contains the original class-based (non-UVM) testbench the environment was converted from, kept for comparison. Both testbenches drive the same DUT through the same interface, which is what makes the comparison meaningful rather than two unrelated projects in one repo.
+
+```
+RTL/             main.sv, fifo_if.sv          — DUT and interface (shared by both testbenches)
+UVM/             11 files                     — the UVM environment
+Original FIFO/   4 files + run log            — the pre-UVM class-based testbench
+```
 
 ---
 
@@ -69,20 +76,20 @@ An 8-bit wide, 8-deep synchronous FIFO.
 
 | File | Role |
 |---|---|
-| `main.sv` | DUT — the FIFO itself, with inline SVA |
-| `fifo_if.sv` | Interface with clocking block |
-| `fifo_transaction.sv` | Sequence item; constrained so illegal stimulus is never generated |
-| `fifo_sequence.sv` | Constrained-random stimulus generator |
-| `fifo_sequencer.sv` | Sequencer |
-| `fifo_driver.sv` | Drives the DUT through the clocking block |
-| `fifo_monitor.sv` | Observes the interface, broadcasts transactions, owns the covergroup |
-| `fifo_scoreboard.sv` | Queue-based reference model and checker |
-| `fifo_agent.sv` | Bundles sequencer + driver + monitor |
-| `fifo_env.sv` | Bundles agent + scoreboard |
-| `fifo_test.sv` | Top-level test; starts the sequence |
-| `fifo_pkg.sv` | Package that includes all classes in dependency order |
-| `fifo_uvm_top.sv` | Simulation top: clock, reset, DUT instantiation, `run_test()` |
-| `driver.sv` `monitor.sv` `scoreboard.sv` `tb.sv` | Original non-UVM testbench, kept for comparison |
+| `RTL/main.sv` | DUT — the FIFO itself, with inline SVA |
+| `RTL/fifo_if.sv` | Interface with clocking block |
+| `UVM/fifo_transaction.sv` | Sequence item; constrained so illegal stimulus is never generated |
+| `UVM/fifo_sequence.sv` | Constrained-random stimulus generator |
+| `UVM/fifo_sequencer.sv` | Sequencer |
+| `UVM/fifo_driver.sv` | Drives the DUT through the clocking block |
+| `UVM/fifo_monitor.sv` | Observes the interface, broadcasts transactions, owns the covergroup |
+| `UVM/fifo_scoreboard.sv` | Queue-based reference model and checker |
+| `UVM/fifo_agent.sv` | Bundles sequencer + driver + monitor |
+| `UVM/fifo_env.sv` | Bundles agent + scoreboard |
+| `UVM/fifo_test.sv` | Top-level test; starts the sequence |
+| `UVM/fifo_pkg.sv` | Package that includes all classes in dependency order |
+| `UVM/fifo_uvm_top.sv` | Simulation top: clock, reset, DUT instantiation, `run_test()` |
+| `Original FIFO/driver.sv` `monitor.sv` `scoreboard.sv` `tb.sv` | Original non-UVM testbench, kept for comparison |
 
 ---
 
@@ -90,13 +97,15 @@ An 8-bit wide, 8-deep synchronous FIFO.
 
 **Vivado setup**
 
-1. Add to Simulation Sources: `fifo_if.sv`, `main.sv`, `fifo_pkg.sv`, `fifo_uvm_top.sv`, and the nine `fifo_*.sv` class files
-2. Set the nine class files to file type **Verilog Header** — they are compiled via `fifo_pkg.sv`, never standalone
+1. Add to Simulation Sources: `RTL/fifo_if.sv`, `RTL/main.sv`, `UVM/fifo_pkg.sv`, `UVM/fifo_uvm_top.sv`, and the nine class files from `UVM/`
+2. Set the nine class files to file type **Verilog Header** — they are compiled via `UVM/fifo_pkg.sv`, never standalone
 3. Simulation top: `fifo_uvm_top`
 4. Settings → Simulation → **Elaboration** → `xelab.more_options`: add `-L uvm`
 5. Run Behavioral Simulation, then **Run All** (the default 1000 ns runtime truncates the test)
 
-**Compile order:** `fifo_if.sv` → `main.sv` → `fifo_pkg.sv` → `fifo_uvm_top.sv`
+**Compile order:** `RTL/fifo_if.sv` → `RTL/main.sv` → `UVM/fifo_pkg.sv` → `UVM/fifo_uvm_top.sv`
+
+`fifo_pkg.sv`'s `` `include `` paths resolve relative to the package file, so the nine class files must stay alongside it in `UVM/`.
 
 **Runtime options** (`xsim.simulate.more_options`)
 
@@ -163,6 +172,9 @@ vif.cb.wr_en <= tr.wr_en;
 Zero mismatches on the next run — the transaction that failed at 85,000 ns passed with the identical expected value.
 
 **Rejected.** Adding a delay (`#1`) after the edge to dodge the race. That hides the problem behind a magic number and breaks the moment the clock period changes. The interface already declared a clocking block for exactly this purpose; the driver simply wasn't using it.
+
+![Non-UVM testbench simulation](FIFO_Simulation_Non_UVM.png)
+*The original class-based testbench running against the same DUT.*
 
 ### 1.2 Latency misalignment between `rd_en` and `rd_op` (non-UVM)
 
