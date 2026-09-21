@@ -44,7 +44,7 @@ An 8-bit wide, 8-deep synchronous FIFO.
 - Registered read output (1-cycle read latency)
 - `full` / `empty` flag generation
 - Concurrent read and write support
-- Three inline SVA properties: no write when full, no read when empty, occupancy stays within `[0:8]`
+- Three inline SVA properties, checked in simulation: no write when full, no read when empty, occupancy stays within `[0:8]`
 
 ---
 
@@ -119,30 +119,23 @@ The covergroup lives in the monitor and samples once per clock.
 | `cx_op_full` | Which operations occurred while full |
 | `cx_op_empty` | Which operations occurred while empty |
 
-### Unreachable is not uncovered
-
-An earlier covergroup used four 1-bit coverpoints (`wr_en`, `rd_en`, `full`, `empty`) and a single cross. It reported 100% within a few hundred cycles while proving almost nothing — every bin is trivially hit by random traffic. It was replaced with the model above, which measures FIFO *behaviour*: transitions, occupancy levels, and operation-vs-state corners.
-
-That model first reported **83.33%**, with both crosses at 50%. The four unhit bins were:
-
-- WRITE while full
-- BOTH while full
-- READ while empty
-- BOTH while empty
-
-None of these are stimulus gaps. They are forbidden by the transaction constraints (`c_no_write_when_full`, `c_no_read_when_empty`) and by the DUT's own SVA. Reaching them would have meant loosening constraints to generate illegal stimulus purely to inflate a metric.
-
-They are instead declared `illegal_bins`, which removes them from the coverage denominator *and* raises a runtime error if they are ever hit — turning a documented assumption into an active check. Across 100,001 cycles none fired, so the constraint contract is confirmed three independent ways: the solver refuses to generate the combinations, the DUT's SVA never asserts, and the coverage model never flags them.
-
-`ignore_bins` is used separately to narrow each cross to the question being asked; a cross diluted with uninteresting combinations yields a percentage nobody can interpret.
-
 The monitor's `report_phase` prints the per-coverpoint breakdown and emits `COVERAGE CLOSED` at 100%, or a `uvm_warning` below it — so closure is machine-checkable rather than eyeballed.
 
 ---
 
-## Notable debug: a one-cycle data shift
+# Problems faced
 
-After the environment was running, the scoreboard reported 38 mismatches with a distinctive signature:
+Every issue encountered across both testbenches, grouped by nature, with the symptom, the root cause, and the path taken — including options considered and rejected.
+
+---
+
+## 1. Timing and race conditions
+
+These were the hardest to diagnose, because nothing errors — the simulation runs happily and produces wrong data.
+
+### 1.1 Read data shifted by one cycle (UVM)
+
+**Symptom.** 38 scoreboard mismatches with a distinctive signature — `Got` was always the *previous* `Expected`:
 
 ```
 @85000  MISMATCH Expected=92  Got=0
@@ -150,9 +143,7 @@ After the environment was running, the scoreboard reported 38 mismatches with a 
 @195000 MISMATCH Expected=199 Got=123
 ```
 
-`Got` was always the *previous* `Expected` — every read was returning the prior read's data, with the first returning the reset value.
-
-**Cause.** The driver was assigning the raw interface signals at a clock edge:
+**Cause.** The driver assigned the raw interface signals on a clock edge:
 
 ```systemverilog
 @(posedge vif.clk);
@@ -161,25 +152,204 @@ vif.wr_en <= tr.wr_en;      // races the DUT's always_ff on the same edge
 
 Testbench assignment and DUT sampling landed on the same edge, shifting all data by one cycle.
 
-**Fix.** Drive through the clocking block, which applies values at its defined output skew:
+**Path chosen.** Drive through the clocking block, which applies values at its defined output skew:
 
 ```systemverilog
 @(vif.cb);
 vif.cb.wr_en <= tr.wr_en;
 ```
 
-Zero mismatches on the next run. The same transaction that previously failed at 85,000 ns passed with the identical expected value.
+Zero mismatches on the next run — the transaction that failed at 85,000 ns passed with the identical expected value.
+
+**Rejected.** Adding a delay (`#1`) after the edge to dodge the race. That hides the problem behind a magic number and breaks the moment the clock period changes. The interface already declared a clocking block for exactly this purpose; the driver simply wasn't using it.
+
+### 1.2 Latency misalignment between `rd_en` and `rd_op` (non-UVM)
+
+**Symptom.** Read data compared against the wrong queue entry.
+
+**Cause.** The DUT registers its read output, so `rd_op` is valid one cycle after `rd_en` is asserted.
+
+**Path chosen.** Delay the read-enable by one cycle in the monitor (`rd_en_d1`) and compare when the *delayed* enable is high, so the check aligns with when data is actually present. Carried forward unchanged into the UVM monitor.
+
+### 1.3 Driver reading DUT status signals (non-UVM)
+
+**Symptom.** Intermittent, hard-to-reproduce stimulus errors.
+
+**Cause.** The driver made decisions based on the DUT's live `full`/`empty` flags, creating a same-cycle dependency between generation and design state.
+
+**Path chosen.** Give the stimulus its own model. The driver — and later the sequence — tracks `expected_count` independently and never reads DUT outputs. Generation cannot race the design if it never looks at it.
+
+### 1.4 Scoreboard desynchronization on underflow (non-UVM)
+
+**Symptom.** After a single underflow, every subsequent comparison was wrong.
+
+**Cause.** Popping from an empty reference queue left the model permanently offset from the DUT.
+
+**Path chosen.** Detect and report the empty-queue case explicitly instead of popping. A desynchronized scoreboard reports thousands of failures from one root cause; flagging the underflow keeps the first failure readable.
 
 ---
 
-## Other issues resolved during bring-up
+## 2. Compilation and scoping
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `fifo_transaction not declared` | Class files compiled as separate compilation units couldn't see each other | Wrap all classes in a package |
-| `UVM_FATAL: Requested test not found` | Top named the test only as a string, so classes were never elaborated and the factory never registered them | `import fifo_pkg::*;` in the top module |
-| `UVM_FATAL [RUNPHSTIME]` | Reset consumed 15 ns before `run_test()` | Reset moved to a concurrent `initial` block; driver and monitor wait on `rst` |
-| `embedded coverage group cannot be instantiated outside new()` | Covergroup constructed in `build_phase` | Construct in `new()` — coverpoint expressions evaluate at `sample()` time, so a not-yet-resolved `vif` is fine |
+### 2.1 `fifo_transaction is not declared`
+
+**Symptom.** `fifo_sequencer.sv` could not see `fifo_transaction`, despite both being in the project.
+
+**Cause.** Each `.sv` file compiled as its own compilation unit, so class definitions were invisible to one another.
+
+**Path chosen.** Wrap every class in a package (`fifo_pkg.sv`) that `` `include ``s them in dependency order, giving them one shared scope. This is why production UVM environments are package-based.
+
+**Rejected.** Manually ordering the files in Vivado's compile-order view. It appeared to work at first and is how the problem was initially approached — but it is fragile, tool-specific, and does not survive the file list changing.
+
+### 2.2 Class files still compiling standalone
+
+**Symptom.** After adding the package, the same "not declared" errors persisted.
+
+**Cause.** The class files were still listed as compiled sources, so each was *also* compiled on its own, outside the package.
+
+**Path chosen.** Set the nine class files to file type **Verilog Header** in Vivado. They stay in the project and remain editable, but are pulled in only through the package.
+
+### 2.3 The same file compiled twice
+
+**Symptom.** Duplicate-declaration errors for the interface.
+
+**Cause.** `fifo_if.sv` had been added to both Design Sources and Simulation Sources.
+
+**Path chosen.** Keep one copy in Design Sources — it is compiled for simulation anyway — and remove the duplicate.
+
+---
+
+## 3. UVM framework and phasing
+
+### 3.1 `UVM_FATAL: Requested test from call to run_test(fifo_test) not found`
+
+**Symptom.** Elaboration succeeded, then the simulation died immediately at 15 ns.
+
+**Cause.** The top module referenced the test only as a *string*. Nothing pulled the class files into elaboration, so the factory had never registered `fifo_test`.
+
+**Path chosen.** `import fifo_pkg::*;` in the top module — this makes every class visible and registered, and keeps `run_test()` string-driven so the test can still be swapped from the command line.
+
+### 3.2 `UVM_FATAL [RUNPHSTIME]: The run phase must start at time 0`
+
+**Symptom.** Fatal at 15 ns, immediately after reset completed.
+
+**Cause.** The reset sequence ran *before* `run_test()`, consuming 15 ns. UVM requires the run phase to begin at time 0.
+
+**Path chosen.** Move reset into its own `initial` block so it runs *concurrently* with UVM, and have the driver and monitor each wait on `rst` deasserting before acting. This also prevents the monitor from observing reset-time activity and pushing phantom transactions into the scoreboard.
+
+**Rejected.** Turning reset into a UVM sequence. Reset here is a one-time, deterministic, non-randomized event — routing it through the sequencer/driver path would be machinery without benefit.
+
+### 3.3 Embedded covergroup constructed in the wrong phase
+
+**Symptom.** `ERROR: [VRFC 10-8922] embedded coverage group 'cg' cannot be instantiated outside the 'new' method of the encompassing class`.
+
+**Cause.** The covergroup was moved to `build_phase` out of a concern that the virtual interface was still null in `new()`.
+
+**Path chosen.** Construct it in `new()`, as the language requires. The concern was unfounded: coverpoint expressions are evaluated when `sample()` is called, not at construction, and by then `vif` has long been resolved in `build_phase`.
+
+---
+
+## 4. Coverage modelling
+
+### 4.1 A covergroup that measured nothing
+
+**Symptom.** The original covergroup — four 1-bit coverpoints (`wr_en`, `rd_en`, `full`, `empty`) plus one cross — reported 100% within a few hundred cycles.
+
+**Cause.** Every bin is trivially hit by random traffic. The metric was technically closed and substantively meaningless.
+
+**Path chosen.** Replace it with a model of FIFO *behaviour*: operation type (`IDLE`/`READ`/`WRITE`/`BOTH`), **transition** bins on `full` and `empty` (`0=>1`, `1=>0`) to prove the flags were entered and left, every occupancy level 0–8, and crosses of operation against full/empty. Coverage dropped to 83.33%, which was the honest starting point.
+
+### 4.2 Crosses stuck at 50% — unreachable, not uncovered
+
+**Symptom.** `cx_op_full` and `cx_op_empty` each reported 50%. The unhit bins were WRITE-while-full, BOTH-while-full, READ-while-empty, BOTH-while-empty.
+
+**Cause.** Not stimulus gaps. Those combinations are forbidden by the transaction constraints (`c_no_write_when_full`, `c_no_read_when_empty`) and by the DUT's own SVA. They cannot occur by construction.
+
+**Path chosen.** Declare them `illegal_bins`. This removes them from the coverage denominator — so 100% is an honest figure — *and* raises a runtime error if they are ever hit, converting a documented assumption into an active check. Across 100,001 cycles none fired, so the constraint contract is confirmed three independent ways: the solver refuses to generate them, the DUT's SVA never asserts, and the coverage model never flags them.
+
+**Rejected.** Loosening the constraints to reach those bins. That means generating illegal stimulus purely to inflate a metric — the number would rise while the verification got worse.
+
+`ignore_bins` is used separately, to narrow each cross to the question being asked. A cross diluted with uninteresting combinations produces a percentage nobody can interpret.
+
+### 4.3 Coverpoints could not be named
+
+**Symptom.** `WARNING: [VRFC 10-8992] hierarchical name cannot be in an identifier list`.
+
+**Cause.** `coverpoint vif.wr_en;` — a coverpoint name cannot be derived from a hierarchical reference.
+
+**Path chosen.** Give every coverpoint an explicit label (`cp_wr_en`, `cx_rd_wr`, …). Beyond clearing the warning, this is what makes a coverage report readable: *"`BOTH` was never exercised"* rather than *"cross bin 3 unhit."*
+
+---
+
+## 5. Scale and reporting
+
+### 5.1 Log growth made results unreadable
+
+**Symptom.** At 10,001 cycles the log was already 600 KB, because every passing check printed a line. At 100,001 it would have been ~6 MB.
+
+**Cause.** Per-transaction `uvm_info` at `UVM_LOW`, which is printed by default.
+
+**Path chosen.** Demote per-check messages to `UVM_HIGH` so they are filtered by default, and add running tallies printed once in `report_phase`. The log dropped from 600 KB to roughly seven lines while retaining every number that matters. `+UVM_VERBOSITY=UVM_HIGH` restores the per-check detail for debugging.
+
+### 5.2 A silent pass was possible
+
+**Symptom.** None — this was a latent hazard, not an observed failure.
+
+**Cause.** If the monitor never fired, the scoreboard would perform zero comparisons and report "0 mismatches", which reads as a pass.
+
+**Path chosen.** Raise an error in `report_phase` when zero checks were performed. A test that checks nothing must not report as passing.
+
+### 5.3 Run length was hardcoded
+
+**Symptom.** Changing the transaction count required editing the sequence and recompiling.
+
+**Path chosen.** Read it from a plusarg — `+RUNCYCLES=<n>` — with a default. One compiled snapshot now serves short smoke runs and long soak runs, which is how regressions actually operate.
+
+---
+
+## 6. Tooling and environment
+
+### 6.1 UVM library not linked
+
+**Symptom.** UVM types unresolved at elaboration.
+
+**Path chosen.** Add `-L uvm` to the elaboration options (`xelab.more_options`). Linking (`-L uvm`), importing (`import uvm_pkg::*`) and macro inclusion (`` `include "uvm_macros.svh" ``) are three separate requirements that are easy to confuse — all three are needed.
+
+### 6.2 Simulation constructs rejected during synthesis
+
+**Symptom.** Errors on clocking blocks and `std::randomize`.
+
+**Cause.** Simulation-only files had been placed in Design Sources.
+
+**Path chosen.** Keep only the DUT and interface as design sources; everything testbench-side lives in Simulation Sources.
+
+### 6.3 Simulation stopped after 1000 ns
+
+**Symptom.** The test appeared to pass but only ~100 transactions had run.
+
+**Cause.** Vivado's default `xsim.simulate.runtime` is 1000 ns.
+
+**Path chosen.** Use **Run All** rather than the default runtime. Worth knowing that a run can terminate "cleanly" long before the test is finished.
+
+### 6.4 Editor buffer overwrote source edits
+
+**Symptom.** A fixed file reverted to its previous contents, and the same compile error reappeared.
+
+**Cause.** The file was open in Vivado's editor, which flushed its stale buffer back to disk.
+
+**Path chosen.** Close source files in the editor when editing them externally. Vivado compiles from disk, so a stale open tab silently undoes outside changes.
+
+---
+
+## 7. Known and accepted
+
+### 7.1 SVA fires during shutdown in the non-UVM testbench
+
+**Symptom.** The write-when-full assertion fires repeatedly during the trailing delay after the driver exits.
+
+**Cause.** The `fork...join_any` shutdown leaves `wr_en` asserted on the interface while the monitor thread continues running.
+
+**Path chosen.** Diagnosed, documented, and deliberately deprioritized. It is a testbench shutdown artifact, not a DUT defect, and it affects only the superseded non-UVM testbench. The UVM environment terminates cleanly via objection drop and does not exhibit it.
 
 ---
 
@@ -189,22 +359,4 @@ Zero mismatches on the next run. The same transaction that previously failed at 
 - **Stimulus independent of the DUT.** The sequence tracks its own `expected_count` instead of reading `full`/`empty`, so generation never races the design.
 - **Analysis ports over direct calls.** The monitor broadcasts; it has no knowledge of the scoreboard. Consumers can be added without touching monitor code.
 - **Factory construction throughout.** Every component is built with `type_id::create`, so any of them can be substituted from the test level via a factory override without editing structural code.
-- **Reporting over printing.** Per-check messages are emitted at `UVM_HIGH` and filtered by default; the scoreboard and monitor each print one consolidated summary in `report_phase`. This dropped the log from 600 KB to a handful of lines.
-- **A test that checks nothing must not pass.** The scoreboard raises an error if zero comparisons were performed, so a broken environment cannot report "0 mismatches" and look healthy.
-
----
-
-## Scope
-
-**Not parameterized.** `DATA_WIDTH` and `FIFO_DEPTH` are fixed at 8.
-
-**No formal verification.** The SVA properties are checked in simulation only. Proving them requires an external tool — Vivado ships no formal property checker.
-
-Both are stated here rather than left implied.
-
----
-
-## Next
-
-- **AXI4-Lite UVM VIP** — master/slave agents, protocol checker, coverage model. Introduces independent channel handshakes, `VALID`/`READY` dependency rules, write-response ordering and outstanding transactions.
-- **Asynchronous FIFO with CDC** — two-clock design, gray-code pointers, synchronizer chains.
+- **Reporting over printing.** Per-check messages are filtered by default; each checker prints one consolidated summary in `report_phase`.
